@@ -3,9 +3,27 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { PublicKey, SystemProgram } from '@solana/web3.js';
-import { Program, AnchorProvider, BN, web3 } from '@coral-xyz/anchor';
+import { Program, AnchorProvider, BN, web3, Idl } from '@coral-xyz/anchor';
 import { GameState, Player, TransactionStatus } from '../types/game';
 import { CONFIG, parseAnchorError, ConnectionManager, updatePlayerStats } from '../utils';
+import raceContractIdl from '../idl/race_contract.json';
+
+// Define the program account structure (matches blockchain snake_case fields)
+interface ProgramGameAccount {
+  authority: PublicKey;
+  game_id: BN;
+  state: any;
+  entry_fee: BN;
+  track_length: number;
+  players: Array<{
+    pubkey: PublicKey;
+    position: number;
+    boosts_remaining: number;
+    finished: boolean;
+  }>;
+  prize_pool: BN;
+  winner: PublicKey | null;
+}
 
 interface UseGameReturn {
   // Game state
@@ -51,7 +69,7 @@ export const useGame = (): UseGameReturn => {
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const connectionManager = useRef<ConnectionManager>(new ConnectionManager());
 
-  // Mock program initialization (since IDL might not be ready)
+  // Initialize program with real IDL
   useEffect(() => {
     if (wallet && connection && publicKey) {
       try {
@@ -61,19 +79,17 @@ export const useGame = (): UseGameReturn => {
           { commitment: 'confirmed' }
         );
 
-        // For now, we'll create a mock program object to pass validation
-        // In production, you'd import the actual IDL here
-        const mockProgram = {
-          methods: {},
-          account: {},
-          provider,
-        } as any;
+        // Create the program with the real IDL
+        const raceProgram = new Program(
+          raceContractIdl as unknown as Idl,
+          CONFIG.PROGRAM_ID,
+          provider
+        );
 
-        setProgram(mockProgram);
-
-        console.log('Mock program initialized for testing');
+        setProgram(raceProgram);
+        console.log('Race contract program initialized with ID:', CONFIG.PROGRAM_ID.toString());
       } catch (err) {
-        console.error('Error initializing provider:', err);
+        console.error('Error initializing program:', err);
         setError('Failed to initialize connection to blockchain');
       }
     } else {
@@ -81,53 +97,49 @@ export const useGame = (): UseGameReturn => {
     }
   }, [wallet, connection, publicKey]);
 
-  // Mock fetch game state (replace with real implementation)
+  // Fetch real game state from blockchain
   const fetchGameState = useCallback(async () => {
-    if (!gameAccount) return;
+    if (!program || !gameAccount) return;
 
     try {
       console.log('Fetching game state for:', gameAccount.toString());
 
-      // Create mock game data based on current state
-      const mockGameState: GameState = {
-        authority: publicKey || new PublicKey("11111111111111111111111111111111"),
-        gameId: gameAccount.toString().slice(-8),
-        state: gameState?.state || 'waitingForPlayers',
-        entryFee: CONFIG.ENTRY_FEE,
-        trackLength: CONFIG.TRACK_LENGTH,
-        players: gameState?.players || [],
-        prizePool: gameState?.prizePool || 0,
-        winner: gameState?.winner || null,
+      // Fetch actual game data from the blockchain
+      const rawGameData = await program.account.game.fetch(gameAccount);
+      const gameData = rawGameData as unknown as ProgramGameAccount;
+
+      // Convert the raw game data to our GameState interface
+      const convertedGameState: GameState = {
+        authority: gameData.authority,
+        gameId: gameData.game_id.toString(),
+        state: convertGameStateEnum(gameData.state),
+        entryFee: gameData.entry_fee.toNumber(),
+        trackLength: gameData.track_length,
+        players: gameData.players.map((player) => ({
+          pubkey: player.pubkey,
+          position: player.position,
+          boostsRemaining: player.boosts_remaining,
+          finished: player.finished,
+        })),
+        prizePool: gameData.prize_pool.toNumber(),
+        winner: gameData.winner,
       };
 
-      setGameState(mockGameState);
-      console.log('Mock game state updated:', mockGameState);
-    } catch (err) {
-      console.error('Error fetching game state:', err);
-      setError('Failed to fetch game state');
-    }
-  }, [gameAccount, publicKey, gameState]);
-    if (!program || !gameAccount) return;
-
-    try {
-      // Mock game data - replace with actual program.account.game.fetch(gameAccount)
-      const mockGameState: GameState = {
-        authority: new PublicKey("11111111111111111111111111111111"),
-        gameId: Date.now().toString(),
-        state: 'waitingForPlayers',
-        entryFee: CONFIG.ENTRY_FEE,
-        trackLength: CONFIG.TRACK_LENGTH,
-        players: [],
-        prizePool: 0,
-        winner: null,
-      };
-
-      setGameState(mockGameState);
+      setGameState(convertedGameState);
+      console.log('Game state updated:', convertedGameState);
     } catch (err) {
       console.error('Error fetching game state:', err);
       setError('Failed to fetch game state');
     }
   }, [program, gameAccount]);
+
+  // Helper function to convert blockchain game state enum to our format
+  const convertGameStateEnum = (state: any): 'waitingForPlayers' | 'inProgress' | 'finished' => {
+    if (state.waitingForPlayers !== undefined) return 'waitingForPlayers';
+    if (state.inProgress !== undefined) return 'inProgress';
+    if (state.finished !== undefined) return 'finished';
+    return 'waitingForPlayers';
+  };
 
   // Set up polling for game state updates
   useEffect(() => {
@@ -185,20 +197,17 @@ export const useGame = (): UseGameReturn => {
     setTransactionStatus({ status: 'pending', message: 'Preparing transaction...' });
 
     try {
-      // Mock transaction execution for now
-      console.log('Executing mock transaction...');
       setTransactionStatus({ status: 'pending', message: 'Sending transaction...' });
 
-      await new Promise(resolve => setTimeout(resolve, 1500));
-
-      const mockSignature = `mock_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const signature = await transactionFn();
 
       setTransactionStatus({
         status: 'success',
         message: successMessage,
-        signature: mockSignature
+        signature: signature
       });
 
+      // Refresh game state after successful transaction
       await fetchGameState();
 
       setTimeout(() => setTransactionStatus(null), 3000);
@@ -218,16 +227,31 @@ export const useGame = (): UseGameReturn => {
     }
   };
 
-  // Game actions (mocked for now)
+  // Game actions using real program methods
   const createGame = async (): Promise<boolean> => {
+    if (!program || !publicKey) return false;
+
     return executeTransaction(async () => {
       const gameKeypair = web3.Keypair.generate();
+
+      const tx = await program!.methods
+        .initializeGame(new BN(CONFIG.ENTRY_FEE), CONFIG.TRACK_LENGTH)
+        .accounts({
+          game: gameKeypair.publicKey,
+          authority: publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([gameKeypair])
+        .rpc();
+
       setGameAccount(gameKeypair.publicKey);
-      return 'mock_signature';
+      return tx;
     }, 'Game created successfully!');
   };
 
   const joinGame = async (gameId?: string): Promise<boolean> => {
+    if (!program || !publicKey) return false;
+
     let targetGameAccount = gameAccount;
 
     if (gameId) {
@@ -246,29 +270,69 @@ export const useGame = (): UseGameReturn => {
     }
 
     return executeTransaction(async () => {
-      return 'mock_signature';
+      const tx = await program!.methods
+        .joinRace()
+        .accounts({
+          game: targetGameAccount!,
+          player: publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      return tx;
     }, 'Joined game successfully!');
   };
 
   const rollDice = async (): Promise<boolean> => {
+    if (!program || !publicKey || !gameAccount) return false;
+
     return executeTransaction(async () => {
-      return 'mock_signature';
+      const tx = await program!.methods
+        .rollAndMove()
+        .accounts({
+          game: gameAccount,
+          player: publicKey,
+        })
+        .rpc();
+
+      return tx;
     }, 'Dice rolled successfully!');
   };
 
   const useBoost = async (): Promise<boolean> => {
+    if (!program || !publicKey || !gameAccount) return false;
+
     return executeTransaction(async () => {
-      return 'mock_signature';
+      const tx = await program!.methods
+        .useBoost()
+        .accounts({
+          game: gameAccount,
+          player: publicKey,
+        })
+        .rpc();
+
+      return tx;
     }, 'Boost used successfully!');
   };
 
   const claimPrize = async (): Promise<boolean> => {
+    if (!program || !publicKey || !gameAccount) return false;
+
     const success = await executeTransaction(async () => {
-      return 'mock_signature';
+      const tx = await program!.methods
+        .claimPrize()
+        .accounts({
+          game: gameAccount,
+          winner: publicKey,
+          rent: web3.SYSVAR_RENT_PUBKEY,
+        })
+        .rpc();
+
+      return tx;
     }, 'Prize claimed successfully!');
 
     if (success && gameState && currentPlayer) {
-      updatePlayerStats(publicKey!.toString(), {
+      updatePlayerStats(publicKey.toString(), {
         won: true,
         distance: currentPlayer.position,
         boostsUsed: CONFIG.BOOSTS_PER_PLAYER - currentPlayer.boostsRemaining,
@@ -291,7 +355,7 @@ export const useGame = (): UseGameReturn => {
   }, [fetchGameState]);
 
   // Computed values
-  const currentPlayer = gameState?.players.find(p =>
+  const currentPlayer = gameState?.players.find((p: Player) =>
     publicKey && p.pubkey.equals(publicKey)
   ) || null;
 
